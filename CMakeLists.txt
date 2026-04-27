@@ -31,6 +31,7 @@ if(MINGW)
     )
 
     target_link_options(CalculagraphTimer PRIVATE
+        -municode
         -static
         -static-libgcc
         -static-libstdc++
