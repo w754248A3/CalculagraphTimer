@@ -9,21 +9,35 @@ namespace
 constexpr wchar_t kWindowClassName[] = L"CalculagraphTimerWindowClass";
 constexpr wchar_t kWindowTitle[] = L"Calculagraph Timer";
 constexpr int kWindowWidth = 360;
-constexpr int kWindowHeight = 88;
+constexpr int kWindowHeight = 112;
 constexpr int kTimerIntervalMs = 1000;
 constexpr int kMaxSecondsBeforeReset = 3600;
-constexpr int kDisplayId = 1001;
-constexpr int kResetButtonId = 1002;
+constexpr int kMainDisplayId = 1001;
+constexpr int kMainResetButtonId = 1002;
+constexpr int kTargetDisplayId = 1003;
+constexpr int kTargetInputId = 1004;
+constexpr int kTargetResetButtonId = 1005;
 constexpr int kMainTimerId = 1;
 constexpr BYTE kWindowAlpha = 220;
 
-int g_elapsedSeconds = 0;
-HWND g_displayHandle = nullptr;
-HWND g_resetButtonHandle = nullptr;
-HFONT g_displayFont = nullptr;
-HBRUSH g_backgroundBrush = nullptr;
+struct TargetTimeState
+{
+    bool hasValidTarget = false;
+    SYSTEMTIME targetTime{};
+};
 
-// 将当前累计秒数转换为“分:秒”字符串，并显示到界面。
+int g_elapsedSeconds = 0;
+HWND g_mainDisplayHandle = nullptr;
+HWND g_mainResetButtonHandle = nullptr;
+HWND g_targetDisplayHandle = nullptr;
+HWND g_targetInputHandle = nullptr;
+HWND g_targetResetButtonHandle = nullptr;
+HFONT g_mainDisplayFont = nullptr;
+HFONT g_smallControlFont = nullptr;
+HBRUSH g_backgroundBrush = nullptr;
+TargetTimeState g_targetTimeState{};
+
+// 将当前累计秒数转换为“分:秒”字符串，并显示到原有计时区域。
 void UpdateTimeDisplay()
 {
     const int minutes = g_elapsedSeconds / 60;
@@ -34,18 +48,18 @@ void UpdateTimeDisplay()
 
     if (written > 0)
     {
-        SetWindowTextW(g_displayHandle, buffer.data());
+        SetWindowTextW(g_mainDisplayHandle, buffer.data());
     }
 }
 
-// 将计时器状态重置到 00:00，并立即刷新显示。
+// 将计时器状态重置到 00:00，并立即刷新原有计时显示。
 void ResetTimerState()
 {
     g_elapsedSeconds = 0;
     UpdateTimeDisplay();
 }
 
-// 每秒更新一次计时，如果达到 1 小时自动归零后继续计时。
+// 每秒更新一次原有计时，如果达到 1 小时自动归零后继续计时。
 void TickTimer()
 {
     const int nextSeconds = g_elapsedSeconds + 1;
@@ -62,46 +76,330 @@ void TickTimer()
     UpdateTimeDisplay();
 }
 
-// 创建用于显示计时文本和重置按钮的子控件。
+// 判断字符是否属于输入两端允许忽略的空白字符。
+bool IsWhitespace(wchar_t character)
+{
+    const bool isSpace = character == L' ';
+    const bool isTab = character == L'\t';
+    const bool isLineBreak = character == L'\n' || character == L'\r';
+
+    return isSpace || isTab || isLineBreak;
+}
+
+// 去掉输入文本首尾空白，方便后续只验证真正的时间内容。
+std::wstring TrimWhitespace(const std::wstring& text)
+{
+    std::size_t beginIndex = 0;
+    const std::size_t textLength = text.length();
+
+    while (beginIndex < textLength && IsWhitespace(text[beginIndex]))
+    {
+        beginIndex += 1;
+    }
+
+    std::size_t endIndex = textLength;
+
+    while (endIndex > beginIndex && IsWhitespace(text[endIndex - 1]))
+    {
+        endIndex -= 1;
+    }
+
+    const std::size_t trimmedLength = endIndex - beginIndex;
+    return text.substr(beginIndex, trimmedLength);
+}
+
+// 判断字符是否为 ASCII 数字，时间格式只接受 00:00:00 这样的半角数字。
+bool IsDigit(wchar_t character)
+{
+    const bool isAtLeastZero = character >= L'0';
+    const bool isAtMostNine = character <= L'9';
+
+    return isAtLeastZero && isAtMostNine;
+}
+
+// 将两个数字字符转换成 0 到 99 之间的整数。
+int ParseTwoDigitNumber(wchar_t tensCharacter, wchar_t onesCharacter)
+{
+    const int zeroCode = static_cast<int>(L'0');
+    const int tensCode = static_cast<int>(tensCharacter);
+    const int onesCode = static_cast<int>(onesCharacter);
+    const int tensValue = tensCode - zeroCode;
+    const int onesValue = onesCode - zeroCode;
+    const int number = tensValue * 10 + onesValue;
+
+    return number;
+}
+
+// 严格解析 HH:MM:SS 格式，并校验时、分、秒的有效范围。
+bool TryParseTimeText(const std::wstring& text, int& hours, int& minutes, int& seconds)
+{
+    constexpr std::size_t kExpectedLength = 8;
+
+    if (text.length() != kExpectedLength)
+    {
+        return false;
+    }
+
+    const bool hasFirstColon = text[2] == L':';
+    const bool hasSecondColon = text[5] == L':';
+
+    if (!hasFirstColon || !hasSecondColon)
+    {
+        return false;
+    }
+
+    const bool allDigits = IsDigit(text[0]) && IsDigit(text[1]) && IsDigit(text[3]) &&
+                           IsDigit(text[4]) && IsDigit(text[6]) && IsDigit(text[7]);
+
+    if (!allDigits)
+    {
+        return false;
+    }
+
+    const int parsedHours = ParseTwoDigitNumber(text[0], text[1]);
+    const int parsedMinutes = ParseTwoDigitNumber(text[3], text[4]);
+    const int parsedSeconds = ParseTwoDigitNumber(text[6], text[7]);
+
+    const bool hoursInRange = parsedHours >= 0 && parsedHours <= 23;
+    const bool minutesInRange = parsedMinutes >= 0 && parsedMinutes <= 59;
+    const bool secondsInRange = parsedSeconds >= 0 && parsedSeconds <= 59;
+
+    if (!hoursInRange || !minutesInRange || !secondsInRange)
+    {
+        return false;
+    }
+
+    hours = parsedHours;
+    minutes = parsedMinutes;
+    seconds = parsedSeconds;
+    return true;
+}
+
+// 从编辑框读取当前文本，独立封装以保持按钮逻辑清晰。
+std::wstring ReadTargetInputText()
+{
+    const int textLength = GetWindowTextLengthW(g_targetInputHandle);
+
+    if (textLength <= 0)
+    {
+        return {};
+    }
+
+    const int bufferLength = textLength + 1;
+    std::wstring buffer(static_cast<std::size_t>(bufferLength), L'\0');
+    GetWindowTextW(g_targetInputHandle, buffer.data(), bufferLength);
+
+    std::wstring text = buffer.c_str();
+    return text;
+}
+
+// 把本地 SYSTEMTIME 转换为 64 位 FILETIME 数值，便于计算秒级差值。
+bool TryConvertSystemTimeToFileTicks(const SYSTEMTIME& systemTime, unsigned long long& ticks)
+{
+    FILETIME fileTime{};
+    const BOOL converted = SystemTimeToFileTime(&systemTime, &fileTime);
+
+    if (converted == FALSE)
+    {
+        return false;
+    }
+
+    ULARGE_INTEGER largeInteger{};
+    largeInteger.LowPart = fileTime.dwLowDateTime;
+    largeInteger.HighPart = fileTime.dwHighDateTime;
+    ticks = largeInteger.QuadPart;
+    return true;
+}
+
+// 根据已保存的目标时间和当前系统时间，刷新目标时间差输出框。
+void UpdateTargetDifferenceDisplay()
+{
+    if (!g_targetTimeState.hasValidTarget)
+    {
+        return;
+    }
+
+    SYSTEMTIME currentTime{};
+    GetLocalTime(&currentTime);
+
+    unsigned long long targetTicks = 0;
+    const bool targetConverted = TryConvertSystemTimeToFileTicks(g_targetTimeState.targetTime, targetTicks);
+
+    unsigned long long currentTicks = 0;
+    const bool currentConverted = TryConvertSystemTimeToFileTicks(currentTime, currentTicks);
+
+    if (!targetConverted || !currentConverted)
+    {
+        SetWindowTextW(g_targetDisplayHandle, L"时间错误");
+        return;
+    }
+
+    const unsigned long long largerTicks = targetTicks > currentTicks ? targetTicks : currentTicks;
+    const unsigned long long smallerTicks = targetTicks > currentTicks ? currentTicks : targetTicks;
+    const unsigned long long differenceTicks = largerTicks - smallerTicks;
+    constexpr unsigned long long kTicksPerSecond = 10000000ULL;
+    const unsigned long long differenceSeconds = differenceTicks / kTicksPerSecond;
+
+    if (differenceSeconds >= static_cast<unsigned long long>(kMaxSecondsBeforeReset))
+    {
+        SetWindowTextW(g_targetDisplayHandle, L"超出");
+        return;
+    }
+
+    const unsigned long long minutes = differenceSeconds / 60ULL;
+    const unsigned long long seconds = differenceSeconds % 60ULL;
+
+    std::array<wchar_t, 16> buffer{};
+    const int written = swprintf(buffer.data(), buffer.size(), L"%02llu:%02llu", minutes, seconds);
+
+    if (written > 0)
+    {
+        SetWindowTextW(g_targetDisplayHandle, buffer.data());
+    }
+}
+
+// 处理新增重置按钮：空输入取当前时间，非空输入严格解析为当天目标时间。
+void ResetTargetTimeState()
+{
+    SYSTEMTIME resetClickTime{};
+    GetLocalTime(&resetClickTime);
+
+    const std::wstring rawText = ReadTargetInputText();
+    const std::wstring trimmedText = TrimWhitespace(rawText);
+
+    if (trimmedText.empty())
+    {
+        g_targetTimeState.targetTime = resetClickTime;
+        g_targetTimeState.hasValidTarget = true;
+        UpdateTargetDifferenceDisplay();
+        return;
+    }
+
+    int parsedHours = 0;
+    int parsedMinutes = 0;
+    int parsedSeconds = 0;
+    const bool parsed = TryParseTimeText(trimmedText, parsedHours, parsedMinutes, parsedSeconds);
+
+    if (!parsed)
+    {
+        g_targetTimeState.hasValidTarget = false;
+        SetWindowTextW(g_targetDisplayHandle, L"格式错误");
+        return;
+    }
+
+    SYSTEMTIME targetTime = resetClickTime;
+    targetTime.wHour = static_cast<WORD>(parsedHours);
+    targetTime.wMinute = static_cast<WORD>(parsedMinutes);
+    targetTime.wSecond = static_cast<WORD>(parsedSeconds);
+    targetTime.wMilliseconds = 0;
+
+    g_targetTimeState.targetTime = targetTime;
+    g_targetTimeState.hasValidTarget = true;
+    UpdateTargetDifferenceDisplay();
+}
+
+// 为指定控件设置字体，并通过单独函数避免重复发送窗口消息。
+void ApplyFont(HWND controlHandle, HFONT fontHandle)
+{
+    if (fontHandle == nullptr)
+    {
+        return;
+    }
+
+    SendMessageW(controlHandle, WM_SETFONT, reinterpret_cast<WPARAM>(fontHandle), TRUE);
+}
+
+// 创建两行界面控件：新增目标时间行在上方，原有计时器行压缩后保留在下方。
 void CreateChildControls(HWND windowHandle)
 {
-    const int margin = 12;
-    const int buttonWidth = 84;
-    const int buttonHeight = 34;
-    const int displayWidth = kWindowWidth - margin * 3 - buttonWidth;
-    const int displayHeight = 44;
+    RECT clientRect{};
+    GetClientRect(windowHandle, &clientRect);
 
-    g_displayHandle = CreateWindowExW(
+    const int clientWidth = clientRect.right - clientRect.left;
+    const int margin = 6;
+    const int gap = 5;
+    const int rowHeight = 24;
+    const int firstRowTop = 6;
+    const int secondRowTop = firstRowTop + rowHeight + gap;
+    const int targetDisplayWidth = 72;
+    const int targetButtonWidth = 54;
+    const int targetInputWidth = clientWidth - margin * 2 - gap * 2 - targetDisplayWidth - targetButtonWidth;
+    const int mainButtonWidth = 54;
+    const int mainDisplayWidth = clientWidth - margin * 2 - gap - mainButtonWidth;
+
+    g_targetDisplayHandle = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"--:--",
+        WS_CHILD | WS_VISIBLE | SS_CENTER,
+        margin,
+        firstRowTop,
+        targetDisplayWidth,
+        rowHeight,
+        windowHandle,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTargetDisplayId)),
+        GetModuleHandleW(nullptr),
+        nullptr);
+
+    g_targetInputHandle = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        L"EDIT",
+        L"",
+        WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL,
+        margin + targetDisplayWidth + gap,
+        firstRowTop,
+        targetInputWidth,
+        rowHeight,
+        windowHandle,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTargetInputId)),
+        GetModuleHandleW(nullptr),
+        nullptr);
+
+    g_targetResetButtonHandle = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"重置",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        margin + targetDisplayWidth + gap + targetInputWidth + gap,
+        firstRowTop,
+        targetButtonWidth,
+        rowHeight,
+        windowHandle,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTargetResetButtonId)),
+        GetModuleHandleW(nullptr),
+        nullptr);
+
+    g_mainDisplayHandle = CreateWindowExW(
         0,
         L"STATIC",
         L"00:00",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         margin,
-        margin,
-        displayWidth,
-        displayHeight,
+        secondRowTop,
+        mainDisplayWidth,
+        rowHeight,
         windowHandle,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDisplayId)),
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMainDisplayId)),
         GetModuleHandleW(nullptr),
         nullptr);
 
-    g_resetButtonHandle = CreateWindowExW(
+    g_mainResetButtonHandle = CreateWindowExW(
         0,
         L"BUTTON",
         L"重置",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        margin * 2 + displayWidth,
-        margin,
-        buttonWidth,
-        buttonHeight,
+        margin + mainDisplayWidth + gap,
+        secondRowTop,
+        mainButtonWidth,
+        rowHeight,
         windowHandle,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kResetButtonId)),
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMainResetButtonId)),
         GetModuleHandleW(nullptr),
         nullptr);
 
-    const int fontHeight = -28;
-    g_displayFont = CreateFontW(
-        fontHeight,
+    const int mainFontHeight = -18;
+    g_mainDisplayFont = CreateFontW(
+        mainFontHeight,
         0,
         0,
         0,
@@ -116,19 +414,43 @@ void CreateChildControls(HWND windowHandle)
         FF_DONTCARE,
         L"Segoe UI");
 
-    if (g_displayFont != nullptr)
-    {
-        SendMessageW(g_displayHandle, WM_SETFONT, reinterpret_cast<WPARAM>(g_displayFont), TRUE);
-    }
+    const int smallFontHeight = -14;
+    g_smallControlFont = CreateFontW(
+        smallFontHeight,
+        0,
+        0,
+        0,
+        FW_NORMAL,
+        FALSE,
+        FALSE,
+        FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        FF_DONTCARE,
+        L"Segoe UI");
+
+    ApplyFont(g_mainDisplayHandle, g_mainDisplayFont);
+    ApplyFont(g_targetDisplayHandle, g_smallControlFont);
+    ApplyFont(g_targetInputHandle, g_smallControlFont);
+    ApplyFont(g_targetResetButtonHandle, g_smallControlFont);
+    ApplyFont(g_mainResetButtonHandle, g_smallControlFont);
 }
 
 // 统一清理 GDI 资源，防止窗口销毁后发生资源泄露。
 void CleanupResources()
 {
-    if (g_displayFont != nullptr)
+    if (g_mainDisplayFont != nullptr)
     {
-        DeleteObject(g_displayFont);
-        g_displayFont = nullptr;
+        DeleteObject(g_mainDisplayFont);
+        g_mainDisplayFont = nullptr;
+    }
+
+    if (g_smallControlFont != nullptr)
+    {
+        DeleteObject(g_smallControlFont);
+        g_smallControlFont = nullptr;
     }
 
     if (g_backgroundBrush != nullptr)
@@ -138,7 +460,7 @@ void CleanupResources()
     }
 }
 
-// 处理主窗口消息，完成计时逻辑和交互行为。
+// 处理主窗口消息，完成计时逻辑、目标时间差刷新和交互行为。
 LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
@@ -162,6 +484,7 @@ LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPAR
         if (timerId == kMainTimerId)
         {
             TickTimer();
+            UpdateTargetDifferenceDisplay();
         }
         return 0;
     }
@@ -170,9 +493,15 @@ LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPAR
         const int controlId = LOWORD(wParam);
         const int notificationCode = HIWORD(wParam);
 
-        if (controlId == kResetButtonId && notificationCode == BN_CLICKED)
+        if (controlId == kMainResetButtonId && notificationCode == BN_CLICKED)
         {
             ResetTimerState();
+            return 0;
+        }
+
+        if (controlId == kTargetResetButtonId && notificationCode == BN_CLICKED)
+        {
+            ResetTargetTimeState();
             return 0;
         }
         break;
@@ -182,9 +511,20 @@ LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPAR
         HDC deviceContext = reinterpret_cast<HDC>(wParam);
         HWND controlHandle = reinterpret_cast<HWND>(lParam);
 
-        if (controlHandle == g_displayHandle)
+        if (controlHandle == g_mainDisplayHandle)
         {
             SetTextColor(deviceContext, RGB(220, 0, 0));
+            SetBkMode(deviceContext, TRANSPARENT);
+
+            if (g_backgroundBrush != nullptr)
+            {
+                return reinterpret_cast<INT_PTR>(g_backgroundBrush);
+            }
+        }
+
+        if (controlHandle == g_targetDisplayHandle)
+        {
+            SetTextColor(deviceContext, RGB(0, 90, 160));
             SetBkMode(deviceContext, TRANSPARENT);
 
             if (g_backgroundBrush != nullptr)
