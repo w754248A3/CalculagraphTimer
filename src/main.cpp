@@ -8,8 +8,8 @@ namespace
 {
 constexpr wchar_t kWindowClassName[] = L"CalculagraphTimerWindowClass";
 constexpr wchar_t kWindowTitle[] = L"Calculagraph Timer";
-constexpr int kWindowWidth = 360;
-constexpr int kWindowHeight = 112;
+constexpr int kWindowClientWidth = 184;
+constexpr int kWindowClientHeight = 52;
 constexpr int kTimerIntervalMs = 1000;
 constexpr int kMaxSecondsBeforeReset = 3600;
 constexpr int kMainDisplayId = 1001;
@@ -19,6 +19,12 @@ constexpr int kTargetInputId = 1004;
 constexpr int kTargetResetButtonId = 1005;
 constexpr int kMainTimerId = 1;
 constexpr BYTE kWindowAlpha = 220;
+constexpr int kLayoutMargin = 4;
+constexpr int kLayoutGap = 4;
+constexpr int kControlRowHeight = 20;
+constexpr int kTargetDisplayWidth = 40;
+constexpr int kTargetInputWidth = 86;
+constexpr int kResetButtonWidth = 42;
 
 struct TargetTimeState
 {
@@ -148,8 +154,17 @@ bool TryParseTimeText(const std::wstring& text, int& hours, int& minutes, int& s
         return false;
     }
 
-    const bool allDigits = IsDigit(text[0]) && IsDigit(text[1]) && IsDigit(text[3]) &&
-                           IsDigit(text[4]) && IsDigit(text[6]) && IsDigit(text[7]);
+    const bool firstHourDigit = IsDigit(text[0]);
+    const bool secondHourDigit = IsDigit(text[1]);
+    const bool firstMinuteDigit = IsDigit(text[3]);
+    const bool secondMinuteDigit = IsDigit(text[4]);
+    const bool firstSecondDigit = IsDigit(text[6]);
+    const bool secondSecondDigit = IsDigit(text[7]);
+
+    const bool hasValidHourDigits = firstHourDigit && secondHourDigit;
+    const bool hasValidMinuteDigits = firstMinuteDigit && secondMinuteDigit;
+    const bool hasValidSecondDigits = firstSecondDigit && secondSecondDigit;
+    const bool allDigits = hasValidHourDigits && hasValidMinuteDigits && hasValidSecondDigits;
 
     if (!allDigits)
     {
@@ -230,12 +245,20 @@ void UpdateTargetDifferenceDisplay()
 
     if (!targetConverted || !currentConverted)
     {
-        SetWindowTextW(g_targetDisplayHandle, L"时间错误");
+        SetWindowTextW(g_targetDisplayHandle, L"错误");
         return;
     }
 
-    const unsigned long long largerTicks = targetTicks > currentTicks ? targetTicks : currentTicks;
-    const unsigned long long smallerTicks = targetTicks > currentTicks ? currentTicks : targetTicks;
+    unsigned long long largerTicks = currentTicks;
+    unsigned long long smallerTicks = targetTicks;
+    const bool targetIsLater = targetTicks > currentTicks;
+
+    if (targetIsLater)
+    {
+        largerTicks = targetTicks;
+        smallerTicks = currentTicks;
+    }
+
     const unsigned long long differenceTicks = largerTicks - smallerTicks;
     constexpr unsigned long long kTicksPerSecond = 10000000ULL;
     const unsigned long long differenceSeconds = differenceTicks / kTicksPerSecond;
@@ -283,7 +306,7 @@ void ResetTargetTimeState()
     if (!parsed)
     {
         g_targetTimeState.hasValidTarget = false;
-        SetWindowTextW(g_targetDisplayHandle, L"格式错误");
+        SetWindowTextW(g_targetDisplayHandle, L"错误");
         return;
     }
 
@@ -309,95 +332,174 @@ void ApplyFont(HWND controlHandle, HFONT fontHandle)
     SendMessageW(controlHandle, WM_SETFONT, reinterpret_cast<WPARAM>(fontHandle), TRUE);
 }
 
-// 创建两行界面控件：新增目标时间行在上方，原有计时器行压缩后保留在下方。
-void CreateChildControls(HWND windowHandle)
+// 保存一行控件的水平和垂直位置，便于后续创建窗口控件。
+struct ControlRowLayout
 {
-    RECT clientRect{};
-    GetClientRect(windowHandle, &clientRect);
+    int top = 0;
+    int displayLeft = 0;
+    int displayWidth = 0;
+    int inputLeft = 0;
+    int inputWidth = 0;
+    int buttonLeft = 0;
+};
 
-    const int clientWidth = clientRect.right - clientRect.left;
-    const int margin = 6;
-    const int gap = 5;
-    const int rowHeight = 24;
-    const int firstRowTop = 6;
-    const int secondRowTop = firstRowTop + rowHeight + gap;
-    const int targetDisplayWidth = 72;
-    const int targetButtonWidth = 54;
-    const int targetInputWidth = clientWidth - margin * 2 - gap * 2 - targetDisplayWidth - targetButtonWidth;
-    const int mainButtonWidth = 54;
-    const int mainDisplayWidth = clientWidth - margin * 2 - gap - mainButtonWidth;
+// 计算目标时间行的控件位置，让输入框只保留 HH:MM:SS 所需宽度。
+ControlRowLayout BuildTargetRowLayout()
+{
+    ControlRowLayout layout{};
 
-    g_targetDisplayHandle = CreateWindowExW(
+    layout.top = kLayoutMargin;
+    layout.displayLeft = kLayoutMargin;
+    layout.displayWidth = kTargetDisplayWidth;
+
+    const int inputLeftOffset = layout.displayWidth + kLayoutGap;
+    layout.inputLeft = layout.displayLeft + inputLeftOffset;
+    layout.inputWidth = kTargetInputWidth;
+
+    const int buttonLeftOffset = layout.inputWidth + kLayoutGap;
+    layout.buttonLeft = layout.inputLeft + buttonLeftOffset;
+
+    return layout;
+}
+
+// 计算主计时行的控件位置，宽度跟随紧凑窗口的客户区。
+ControlRowLayout BuildMainRowLayout()
+{
+    ControlRowLayout layout{};
+
+    const int firstRowBottom = kLayoutMargin + kControlRowHeight;
+    layout.top = firstRowBottom + kLayoutGap;
+    layout.displayLeft = kLayoutMargin;
+
+    const int rightMarginWidth = kLayoutMargin;
+    const int buttonAndGapWidth = kResetButtonWidth + kLayoutGap;
+    const int reservedWidth = rightMarginWidth + buttonAndGapWidth;
+    layout.displayWidth = kWindowClientWidth - kLayoutMargin - reservedWidth;
+
+    const int buttonLeftOffset = layout.displayWidth + kLayoutGap;
+    layout.buttonLeft = layout.displayLeft + buttonLeftOffset;
+
+    return layout;
+}
+
+// 创建一个静态文本控件，用于显示计时结果或目标时间差。
+HWND CreateDisplayControl(
+    HWND parentWindowHandle,
+    int controlId,
+    const wchar_t* text,
+    int left,
+    int top,
+    int width,
+    DWORD alignmentStyle)
+{
+    const DWORD style = WS_CHILD | WS_VISIBLE | alignmentStyle;
+    HINSTANCE instanceHandle = GetModuleHandleW(nullptr);
+    HMENU menuHandle = reinterpret_cast<HMENU>(static_cast<INT_PTR>(controlId));
+
+    HWND controlHandle = CreateWindowExW(
         0,
         L"STATIC",
-        L"--:--",
-        WS_CHILD | WS_VISIBLE | SS_CENTER,
-        margin,
-        firstRowTop,
-        targetDisplayWidth,
-        rowHeight,
-        windowHandle,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTargetDisplayId)),
-        GetModuleHandleW(nullptr),
+        text,
+        style,
+        left,
+        top,
+        width,
+        kControlRowHeight,
+        parentWindowHandle,
+        menuHandle,
+        instanceHandle,
         nullptr);
 
-    g_targetInputHandle = CreateWindowExW(
+    return controlHandle;
+}
+
+// 创建一个重置按钮控件，两行按钮共用相同尺寸以保持界面整齐。
+HWND CreateResetButton(HWND parentWindowHandle, int controlId, int left, int top)
+{
+    const DWORD style = WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON;
+    HINSTANCE instanceHandle = GetModuleHandleW(nullptr);
+    HMENU menuHandle = reinterpret_cast<HMENU>(static_cast<INT_PTR>(controlId));
+
+    HWND controlHandle = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"重置",
+        style,
+        left,
+        top,
+        kResetButtonWidth,
+        kControlRowHeight,
+        parentWindowHandle,
+        menuHandle,
+        instanceHandle,
+        nullptr);
+
+    return controlHandle;
+}
+
+// 创建目标时间输入框，宽度控制为刚好显示类似 17:44:44 的时间字符串。
+HWND CreateTargetInput(HWND parentWindowHandle, const ControlRowLayout& layout)
+{
+    const DWORD style = WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL;
+    HINSTANCE instanceHandle = GetModuleHandleW(nullptr);
+    HMENU menuHandle = reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTargetInputId));
+
+    HWND controlHandle = CreateWindowExW(
         WS_EX_CLIENTEDGE,
         L"EDIT",
         L"",
-        WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL,
-        margin + targetDisplayWidth + gap,
-        firstRowTop,
-        targetInputWidth,
-        rowHeight,
-        windowHandle,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTargetInputId)),
-        GetModuleHandleW(nullptr),
+        style,
+        layout.inputLeft,
+        layout.top,
+        layout.inputWidth,
+        kControlRowHeight,
+        parentWindowHandle,
+        menuHandle,
+        instanceHandle,
         nullptr);
 
-    g_targetResetButtonHandle = CreateWindowExW(
-        0,
-        L"BUTTON",
-        L"重置",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        margin + targetDisplayWidth + gap + targetInputWidth + gap,
-        firstRowTop,
-        targetButtonWidth,
-        rowHeight,
-        windowHandle,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTargetResetButtonId)),
-        GetModuleHandleW(nullptr),
-        nullptr);
+    return controlHandle;
+}
 
-    g_mainDisplayHandle = CreateWindowExW(
-        0,
-        L"STATIC",
+// 创建两行紧凑界面控件：目标时间行在上方，原有计时器行在下方。
+void CreateChildControls(HWND windowHandle)
+{
+    const ControlRowLayout targetRow = BuildTargetRowLayout();
+    const ControlRowLayout mainRow = BuildMainRowLayout();
+
+    g_targetDisplayHandle = CreateDisplayControl(
+        windowHandle,
+        kTargetDisplayId,
+        L"--:--",
+        targetRow.displayLeft,
+        targetRow.top,
+        targetRow.displayWidth,
+        SS_CENTER);
+
+    g_targetInputHandle = CreateTargetInput(windowHandle, targetRow);
+
+    g_targetResetButtonHandle = CreateResetButton(
+        windowHandle,
+        kTargetResetButtonId,
+        targetRow.buttonLeft,
+        targetRow.top);
+
+    g_mainDisplayHandle = CreateDisplayControl(
+        windowHandle,
+        kMainDisplayId,
         L"00:00",
-        WS_CHILD | WS_VISIBLE | SS_LEFT,
-        margin,
-        secondRowTop,
-        mainDisplayWidth,
-        rowHeight,
-        windowHandle,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMainDisplayId)),
-        GetModuleHandleW(nullptr),
-        nullptr);
+        mainRow.displayLeft,
+        mainRow.top,
+        mainRow.displayWidth,
+        SS_LEFT);
 
-    g_mainResetButtonHandle = CreateWindowExW(
-        0,
-        L"BUTTON",
-        L"重置",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        margin + mainDisplayWidth + gap,
-        secondRowTop,
-        mainButtonWidth,
-        rowHeight,
+    g_mainResetButtonHandle = CreateResetButton(
         windowHandle,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMainResetButtonId)),
-        GetModuleHandleW(nullptr),
-        nullptr);
+        kMainResetButtonId,
+        mainRow.buttonLeft,
+        mainRow.top);
 
-    const int mainFontHeight = -18;
+    const int mainFontHeight = -17;
     g_mainDisplayFont = CreateFontW(
         mainFontHeight,
         0,
@@ -414,7 +516,7 @@ void CreateChildControls(HWND windowHandle)
         FF_DONTCARE,
         L"Segoe UI");
 
-    const int smallFontHeight = -14;
+    const int smallFontHeight = -13;
     g_smallControlFont = CreateFontW(
         smallFontHeight,
         0,
@@ -582,6 +684,20 @@ bool CreateMainWindow(HINSTANCE instanceHandle, int showCommand)
     constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     constexpr DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED;
 
+    RECT windowRect{};
+    windowRect.right = kWindowClientWidth;
+    windowRect.bottom = kWindowClientHeight;
+
+    const BOOL adjusted = AdjustWindowRectEx(&windowRect, style, FALSE, exStyle);
+
+    if (adjusted == FALSE)
+    {
+        return false;
+    }
+
+    const int adjustedWindowWidth = windowRect.right - windowRect.left;
+    const int adjustedWindowHeight = windowRect.bottom - windowRect.top;
+
     HWND windowHandle = CreateWindowExW(
         exStyle,
         kWindowClassName,
@@ -589,8 +705,8 @@ bool CreateMainWindow(HINSTANCE instanceHandle, int showCommand)
         style,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        kWindowWidth,
-        kWindowHeight,
+        adjustedWindowWidth,
+        adjustedWindowHeight,
         nullptr,
         nullptr,
         instanceHandle,
