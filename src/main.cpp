@@ -4,10 +4,20 @@
 #include <cwchar>
 #include <string>
 
+#ifndef WDA_MONITOR
+#define WDA_MONITOR 0x00000001
+#endif
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
 namespace
 {
 constexpr wchar_t kWindowClassName[] = L"CalculagraphTimerWindowClass";
 constexpr wchar_t kWindowTitle[] = L"Calculagraph Timer";
+constexpr wchar_t kSingleInstanceMutexName[] = L"Global\\CalculagraphTimerSingleInstanceMutex";
+constexpr wchar_t kCenterWindowMessageName[] = L"CalculagraphTimer.CenterWindow";
 constexpr int kWindowClientWidth = 184;
 constexpr int kWindowClientHeight = 52;
 constexpr int kTimerIntervalMs = 1000;
@@ -42,6 +52,59 @@ HFONT g_mainDisplayFont = nullptr;
 HFONT g_smallControlFont = nullptr;
 HBRUSH g_backgroundBrush = nullptr;
 TargetTimeState g_targetTimeState{};
+HANDLE g_singleInstanceMutexHandle = nullptr;
+UINT g_centerWindowMessage = 0;
+
+// 尝试启用窗口显示亲和性，让窗口仍显示在物理屏幕上，但尽量从截图或录屏中排除。
+void ApplyCaptureExclusion(HWND windowHandle)
+{
+    const DWORD preferredAffinity = WDA_EXCLUDEFROMCAPTURE;
+    const BOOL preferredApplied = SetWindowDisplayAffinity(windowHandle, preferredAffinity);
+
+    if (preferredApplied != FALSE)
+    {
+        return;
+    }
+
+    const DWORD fallbackAffinity = WDA_MONITOR;
+    SetWindowDisplayAffinity(windowHandle, fallbackAffinity);
+}
+
+// 计算主屏幕工作区中心点，并把窗口移动到桌面中央，便于第二次启动时找回窗口。
+void CenterWindowOnDesktop(HWND windowHandle)
+{
+    RECT workArea{};
+    const BOOL gotWorkArea = SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+
+    if (gotWorkArea == FALSE)
+    {
+        return;
+    }
+
+    RECT windowRect{};
+    const BOOL gotWindowRect = GetWindowRect(windowHandle, &windowRect);
+
+    if (gotWindowRect == FALSE)
+    {
+        return;
+    }
+
+    const int workAreaWidth = workArea.right - workArea.left;
+    const int workAreaHeight = workArea.bottom - workArea.top;
+    const int windowWidth = windowRect.right - windowRect.left;
+    const int windowHeight = windowRect.bottom - windowRect.top;
+    const int centeredLeft = workArea.left + (workAreaWidth - windowWidth) / 2;
+    const int centeredTop = workArea.top + (workAreaHeight - windowHeight) / 2;
+
+    SetWindowPos(
+        windowHandle,
+        HWND_TOPMOST,
+        centeredLeft,
+        centeredTop,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE);
+}
 
 // 将当前累计秒数转换为“分:秒”字符串，并显示到原有计时区域。
 void UpdateTimeDisplay()
@@ -562,9 +625,32 @@ void CleanupResources()
     }
 }
 
+// 关闭进程级互斥量句柄，让操作系统在程序退出时释放单实例锁。
+void CleanupSingleInstanceMutex()
+{
+    if (g_singleInstanceMutexHandle == nullptr)
+    {
+        return;
+    }
+
+    CloseHandle(g_singleInstanceMutexHandle);
+    g_singleInstanceMutexHandle = nullptr;
+}
+
 // 处理主窗口消息，完成计时逻辑、目标时间差刷新和交互行为。
 LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    // 接收后续实例发送的找回窗口消息，把已经运行的窗口移动到桌面中央。
+    const bool hasCenterWindowMessage = g_centerWindowMessage != 0;
+    const bool matchesCenterWindowMessage = message == g_centerWindowMessage;
+    const bool isCenterWindowMessage = hasCenterWindowMessage && matchesCenterWindowMessage;
+
+    if (isCenterWindowMessage)
+    {
+        CenterWindowOnDesktop(windowHandle);
+        return 0;
+    }
+
     switch (message)
     {
     case WM_CREATE:
@@ -575,6 +661,10 @@ LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPAR
         g_backgroundBrush = CreateSolidBrush(backgroundColor);
 
         SetLayeredWindowAttributes(windowHandle, 0, kWindowAlpha, LWA_ALPHA);
+
+        // 窗口创建完成后启用截图/录屏排除策略，不影响用户在物理显示器上查看。
+        ApplyCaptureExclusion(windowHandle);
+
         SetTimer(windowHandle, kMainTimerId, kTimerIntervalMs, nullptr);
         UpdateTimeDisplay();
         return 0;
@@ -664,6 +754,56 @@ LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPAR
     return DefWindowProcW(windowHandle, message, wParam, lParam);
 }
 
+// 通知已经运行的实例居中显示，然后让当前后续实例自动退出。
+void NotifyRunningInstanceToCenterWindow()
+{
+    HWND runningWindowHandle = FindWindowW(kWindowClassName, nullptr);
+
+    if (runningWindowHandle == nullptr)
+    {
+        return;
+    }
+
+    const WPARAM unusedWParam = 0;
+    const LPARAM unusedLParam = 0;
+    const UINT timeoutFlags = SMTO_ABORTIFHUNG | SMTO_NORMAL;
+    const UINT timeoutMilliseconds = 1000;
+    DWORD_PTR messageResult = 0;
+
+    SendMessageTimeoutW(
+        runningWindowHandle,
+        g_centerWindowMessage,
+        unusedWParam,
+        unusedLParam,
+        timeoutFlags,
+        timeoutMilliseconds,
+        &messageResult);
+}
+
+// 创建全局命名互斥量，确保同一时间只有一个计时器实例在运行。
+bool TryAcquireSingleInstanceMutex()
+{
+    SetLastError(ERROR_SUCCESS);
+    g_singleInstanceMutexHandle = CreateMutexW(nullptr, TRUE, kSingleInstanceMutexName);
+
+    if (g_singleInstanceMutexHandle == nullptr)
+    {
+        return false;
+    }
+
+    const DWORD lastError = GetLastError();
+    const bool alreadyRunning = lastError == ERROR_ALREADY_EXISTS;
+
+    if (alreadyRunning)
+    {
+        NotifyRunningInstanceToCenterWindow();
+        CleanupSingleInstanceMutex();
+        return false;
+    }
+
+    return true;
+}
+
 // 注册窗口类并创建固定尺寸、置顶、半透明的主窗口。
 bool CreateMainWindow(HINSTANCE instanceHandle, int showCommand)
 {
@@ -682,7 +822,12 @@ bool CreateMainWindow(HINSTANCE instanceHandle, int showCommand)
     }
 
     constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    constexpr DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED;
+
+    // 使用工具窗口扩展样式隐藏任务栏按钮，并且不加入 WS_EX_APPWINDOW。
+    constexpr DWORD topmostStyle = WS_EX_TOPMOST;
+    constexpr DWORD layeredStyle = WS_EX_LAYERED;
+    constexpr DWORD taskbarHiddenStyle = WS_EX_TOOLWINDOW;
+    constexpr DWORD exStyle = topmostStyle | layeredStyle | taskbarHiddenStyle;
 
     RECT windowRect{};
     windowRect.right = kWindowClientWidth;
@@ -726,10 +871,27 @@ bool CreateMainWindow(HINSTANCE instanceHandle, int showCommand)
 // 程序入口：创建窗口并进入标准 Win32 消息循环。
 int WINAPI wWinMain(HINSTANCE instanceHandle, HINSTANCE, PWSTR, int showCommand)
 {
+    // 注册跨进程窗口消息，供后续实例通知首个实例把窗口移动到桌面中央。
+    g_centerWindowMessage = RegisterWindowMessageW(kCenterWindowMessageName);
+
+    if (g_centerWindowMessage == 0)
+    {
+        return 1;
+    }
+
+    // 启动早期获取单实例互斥量；如果已有实例，则通知已有窗口并退出当前进程。
+    const bool singleInstanceAcquired = TryAcquireSingleInstanceMutex();
+
+    if (!singleInstanceAcquired)
+    {
+        return 0;
+    }
+
     const bool created = CreateMainWindow(instanceHandle, showCommand);
 
     if (!created)
     {
+        CleanupSingleInstanceMutex();
         return 1;
     }
 
@@ -741,5 +903,6 @@ int WINAPI wWinMain(HINSTANCE instanceHandle, HINSTANCE, PWSTR, int showCommand)
         DispatchMessageW(&message);
     }
 
+    CleanupSingleInstanceMutex();
     return static_cast<int>(message.wParam);
 }
